@@ -105,7 +105,6 @@ rpi = []
 [dependencies]
 libc     = "0.2"
 bitflags = "1.2"
-multiqueue = "0.3.2"
 
 [dependencies.image]
 version  = "0.12"

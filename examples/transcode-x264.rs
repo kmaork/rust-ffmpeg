@@ -16,16 +16,16 @@
 //   transcode-x264 input.mkv output.mkv 'preset=veryslow,crf=18'
 
 extern crate ffmpeg_next as ffmpeg;
-extern crate multiqueue;
 
 use std::collections::HashMap;
-use std::env;
+use std::{env, thread};
 use std::time::Instant;
-use multiqueue::broadcast_queue;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use ffmpeg::{
     codec, decoder, encoder, format, frame, log, media, picture, Dictionary, Packet, Rational,
 };
 use ffmpeg::device::input::audio;
+use ffmpeg::codec::traits::Decoder;
 
 const DEFAULT_X264_OPTS: &str = "preset=medium";
 
@@ -152,6 +152,15 @@ impl AudioDecoder {
     }
 }
 
+fn decode(pkt_receiver: Receiver<Packet>, mut audio_decoder: AudioDecoder) {
+    for pkt in pkt_receiver.iter() {
+        audio_decoder.send_packet_to_decoder(&pkt);
+        audio_decoder.receive_and_process_decoded_frames();
+    }
+    audio_decoder.send_eof_to_decoder();
+    audio_decoder.receive_and_process_decoded_frames();
+}
+
 fn main() {
     let input_file = env::args().nth(1).expect("missing input file");
     let output_file = env::args().nth(2).expect("missing output file");
@@ -159,8 +168,7 @@ fn main() {
         env::args()
             .nth(3)
             .unwrap_or_else(|| DEFAULT_X264_OPTS.to_string()),
-    )
-        .expect("invalid x264 options string");
+    ).expect("invalid x264 options string");
 
     eprintln!("x264 options: {:?}", x264_opts);
 
@@ -175,15 +183,14 @@ fn main() {
     ///////////////////////////////
     let audio_decoder_stream = ictx.streams().best(media::Type::Audio).unwrap();
     let audio_decoder_stream_idx = audio_decoder_stream.index();
-    let audio_decoder_stream_time_base = audio_decoder_stream.time_base();
     let mut audio_decoder = AudioDecoder { decoder: audio_decoder_stream.codec().decoder().audio().unwrap() };
+    let (decoder_sender, decoder_receiver) = sync_channel(100);
+    // let (copy_sender, copy_receiver) = sync_channel(100);
+    let j = thread::spawn(move || decode(decoder_receiver, audio_decoder));
     // VideoEncoder::new()
     //////////////////////////////
 
-    // stream_mapping[ist_i] = ost_i
     let mut stream_mapping: Vec<isize> = vec![0; ictx.nb_streams() as _];
-    let mut ist_time_bases = vec![Rational(0, 0); ictx.nb_streams() as _];
-    let mut ost_time_bases = vec![Rational(0, 0); ictx.nb_streams() as _];
 
     let mut ost_index = 0;
     for (ist_index, ist) in ictx.streams().enumerate() {
@@ -192,7 +199,6 @@ fn main() {
             continue;
         }
         stream_mapping[ist_index] = ost_index;
-        ist_time_bases[ist_index] = ist.time_base();
         // Set up for stream copy for non-video stream.
         let mut ost = octx.add_stream(encoder::find(codec::Id::None)).unwrap();
         ost.set_parameters(ist.parameters());
@@ -209,33 +215,26 @@ fn main() {
     format::context::output::dump(&octx, 0, Some(&output_file));
     octx.write_header().unwrap();
 
-    for (ost_index, stream) in octx.streams().enumerate() {
-        ost_time_bases[ost_index] = stream.time_base();
-    }
-
     for (stream, mut packet) in ictx.packets() {
         let ist_index = stream.index();
         let ost_index = stream_mapping[ist_index];
         if ost_index < 0 {
             continue;
         }
-        let ost_time_base = ost_time_bases[ost_index as usize];
-        packet.rescale_ts(ist_time_bases[ist_index], ost_time_base);
-        packet.set_position(-1);
+        let ost_time_base = octx.stream(ost_index as _).unwrap().time_base();
+        packet.rescale_ts(stream.time_base(), ost_time_base);
         packet.set_stream(ost_index as _);
+        packet.set_position(-1);
+        if ist_index == audio_decoder_stream_idx {
+            decoder_sender.send(packet.clone());
+        }
         packet.write_interleaved(&mut octx).unwrap();
-        // if ist_index == audio_decoder_stream_idx {
-        //     packet.rescale_ts(stream.time_base(), audio_decoder_stream_time_base);
-        //     audio_decoder.send_packet_to_decoder(&packet);
-        //     audio_decoder.receive_and_process_decoded_frames();
-        // }
     }
 
-    // Flush encoders and decoders.
-    audio_decoder.send_eof_to_decoder();
-    audio_decoder.receive_and_process_decoded_frames();
     // video_encoder.send_eof_to_encoder();
     // video_encoder.receive_and_process_encoded_packets(&mut octx, ost_time_base);
 
     octx.write_trailer().unwrap();
+    drop(decoder_sender);
+    j.join();
 }
