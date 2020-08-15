@@ -190,25 +190,23 @@ fn main() {
     // VideoEncoder::new()
     //////////////////////////////
 
-    let mut stream_mapping: Vec<isize> = vec![0; ictx.nb_streams() as _];
+    let mut stream_mapping: Vec<Option<usize>> = vec![None; ictx.nb_streams() as _];
 
     let mut ost_index = 0;
     for (ist_index, ist) in ictx.streams().enumerate() {
-        if ist.codec().medium() == media::Type::Video {
-            stream_mapping[ist_index] = -1;
-            continue;
+        if ist.codec().medium() != media::Type::Video {
+            stream_mapping[ist_index] = Some(ost_index);
+            // Set up for stream copy for non-video stream.
+            let mut ost = octx.add_stream(encoder::find(codec::Id::None)).unwrap();
+            ost.set_parameters(ist.parameters());
+            // We need to set codec_tag to 0 lest we run into incompatible codec tag
+            // issues when muxing into a different container format. Unfortunately
+            // there's no high level API to do this (yet).
+            unsafe {
+                (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+            }
+            ost_index += 1;
         }
-        stream_mapping[ist_index] = ost_index;
-        // Set up for stream copy for non-video stream.
-        let mut ost = octx.add_stream(encoder::find(codec::Id::None)).unwrap();
-        ost.set_parameters(ist.parameters());
-        // We need to set codec_tag to 0 lest we run into incompatible codec tag
-        // issues when muxing into a different container format. Unfortunately
-        // there's no high level API to do this (yet).
-        unsafe {
-            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
-        }
-        ost_index += 1;
     }
 
     octx.set_metadata(ictx.metadata().to_owned());
@@ -217,18 +215,16 @@ fn main() {
 
     for (stream, mut packet) in ictx.packets() {
         let ist_index = stream.index();
-        let ost_index = stream_mapping[ist_index];
-        if ost_index < 0 {
-            continue;
+        if let Some(ost_index) = stream_mapping[ist_index] {
+            let ost_time_base = octx.stream(ost_index).unwrap().time_base();
+            packet.rescale_ts(stream.time_base(), ost_time_base);
+            packet.set_stream(ost_index);
+            packet.set_position(-1);
+            if ist_index == audio_decoder_stream_idx {
+                decoder_sender.send(packet.clone());
+            }
+            packet.write_interleaved(&mut octx).unwrap();
         }
-        let ost_time_base = octx.stream(ost_index as _).unwrap().time_base();
-        packet.rescale_ts(stream.time_base(), ost_time_base);
-        packet.set_stream(ost_index as _);
-        packet.set_position(-1);
-        if ist_index == audio_decoder_stream_idx {
-            decoder_sender.send(packet.clone());
-        }
-        packet.write_interleaved(&mut octx).unwrap();
     }
 
     // video_encoder.send_eof_to_encoder();
@@ -236,5 +232,5 @@ fn main() {
 
     octx.write_trailer().unwrap();
     drop(decoder_sender);
-    j.join();
+    j.join().unwrap();
 }
