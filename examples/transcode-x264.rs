@@ -1,10 +1,3 @@
-// Given an input file, transcode all video streams into H.264 (using libx264)
-// while copying audio and subtitle streams.
-//
-// Invocation:
-//
-//   transcode-x264 <input> <output> [<x264_opts>]
-//
 // <x264_opts> is a comma-delimited list of key=val. default is "preset=medium".
 // See https://ffmpeg.org/ffmpeg-codecs.html#libx264_002c-libx264rgb and
 // https://trac.ffmpeg.org/wiki/Encode/H.264 for available and commonly used
@@ -19,22 +12,17 @@ extern crate ffmpeg_next as ffmpeg;
 
 use std::collections::HashMap;
 use std::{env, thread};
-use std::time::Instant;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use ffmpeg::{codec, decoder, encoder, format, frame, log, media, Dictionary, Packet, Rational, Stream};
+use ffmpeg::{codec, decoder, encoder, format, frame, log, media, Dictionary, Packet, Rational, Stream, Codec};
 use ffmpeg::format::context;
 use ffmpeg::frame::Audio;
+use ffmpeg::codec::Parameters;
 
 const DEFAULT_X264_OPTS: &str = "preset=medium";
 
 struct VideoEncoder {
-    ost_index: usize,
-    encoder: encoder::video::Video,
-    logging_enabled: bool,
-    frame_count: usize,
-    last_log_frame_count: usize,
-    starting_time: Instant,
-    last_log_time: Instant,
+    dumper_stream: DumperStream,
+    encoder: encoder::Video,
 }
 
 impl VideoEncoder {
@@ -42,72 +30,49 @@ impl VideoEncoder {
         width: u32,
         height: u32,
         frame_rate: Rational,
-        octx: &mut format::context::Output,
-        ost_index: usize,
+        dumper: &mut Dumper,
         x264_opts: Dictionary,
-        enable_logging: bool,
     ) -> Result<Self, ffmpeg::Error> {
-        let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
-        let mut ost = octx.add_stream(encoder::find(codec::Id::H264))?;
-        let mut encoder = ost.codec().encoder().video()?;
+        let time_base = frame_rate.invert();
+        let global_header = dumper.has_global_header();
+        let (dumper_stream, context) = dumper.add_video_encoder(encoder::find(codec::Id::H264).unwrap(), time_base);
+        let mut encoder: encoder::video::Video = context.encoder().video()?;
         encoder.set_height(height);
         encoder.set_width(width);
         //encoder.set_aspect_ratio(decoder.aspect_ratio());
-        encoder.set_format(format::Pixel::RGBA);
+        encoder.set_format(format::Pixel::YUV420P);
         encoder.set_frame_rate(Some(frame_rate));
-        encoder.set_time_base(frame_rate.invert());
+        encoder.set_time_base(time_base);
         if global_header {
             encoder.set_flags(codec::Flags::GLOBAL_HEADER);
         }
-        encoder
+        let encoder = encoder
             .open_with(x264_opts)
             .expect("error opening libx264 encoder with supplied settings");
-        encoder = ost.codec().encoder().video()?;
-        ost.set_parameters(encoder);
-        Ok(Self {
-            ost_index,
-            encoder: ost.codec().encoder().video()?,
-            logging_enabled: enable_logging,
-            frame_count: 0,
-            last_log_frame_count: 0,
-            starting_time: Instant::now(),
-            last_log_time: Instant::now(),
-        })
+        Ok(Self { dumper_stream, encoder })
     }
 
-    fn encode_frame(
-        &mut self,
-        octx: &mut format::context::Output,
-        ost_time_base: Rational,
-        ist_time_base: Rational,
-        frame: frame::Video,
-    ) {
-        // frame.set_pts(timestamp);
+    fn gen_frame(&mut self, timestamp: i64) {
+        let mut frame = frame::Video::new(format::Pixel::YUV420P, 100, 100);
+        frame.set_pts(Some(timestamp));
         // frame.set_kind(picture::Type::None);
-        self.send_frame_to_encoder(&frame);
-        self.receive_and_process_encoded_packets(octx, ost_time_base, ist_time_base);
+        self.encoder.send_frame(&frame).unwrap();
+        self.receive_and_process_encoded_packets();
     }
 
-    fn send_frame_to_encoder(&mut self, frame: &frame::Video) {
-        self.encoder.send_frame(frame).unwrap();
-    }
-
-    fn send_eof_to_encoder(&mut self) {
-        self.encoder.send_eof().unwrap();
-    }
-
-    fn receive_and_process_encoded_packets(
-        &mut self,
-        octx: &mut format::context::Output,
-        ost_time_base: Rational,
-        ist_time_base: Rational,
-    ) {
+    fn receive_and_process_encoded_packets(&mut self) {
         let mut encoded = Packet::empty();
         while self.encoder.receive_packet(&mut encoded).is_ok() {
-            encoded.set_stream(self.ost_index);
-            encoded.rescale_ts(ist_time_base, ost_time_base);
-            encoded.write_interleaved(octx).unwrap();
+            self.dumper_stream.send_pkt(encoded.clone());
         }
+    }
+
+    fn gen_frames(mut self) {
+        for i in 0..1000 {
+            self.gen_frame(i);
+        }
+        self.encoder.send_eof().unwrap();
+        self.receive_and_process_encoded_packets();
     }
 }
 
@@ -188,16 +153,28 @@ impl Dumper {
         let (pkt_sender, pkt_receiver) = sync_channel(1000);
         Self { octx, pkt_sender, pkt_receiver }
     }
-    fn add_stream(&mut self, ist: &Stream) -> DumperStream {
+    fn add_stream(&mut self, codec: Option<Codec>, parameters: Parameters, in_time_base: Rational, out_time_base: Rational) -> DumperStream {
         // Set up for stream copy for non-video stream.
-        let mut ost = self.octx.add_stream(encoder::find(codec::Id::None)).unwrap();
-        ost.set_parameters(ist.parameters());
-        ost.set_time_base(ist.time_base());
+        let mut ost = self.octx.add_stream(codec).unwrap();
+        ost.set_parameters(parameters);
+        ost.set_time_base(out_time_base);
         // We need to set codec_tag to 0 lest we run into incompatible codec tag
         // issues when muxing into a different container format. Unfortunately
         // there's no high level API to do this (yet).
         unsafe { (*ost.parameters().as_mut_ptr()).codec_tag = 0; }
-        DumperStream { output_stream: ost.index(), in_time_base: ist.time_base(), out_time_base: ost.time_base(), pkt_sender: self.pkt_sender.clone() }
+        DumperStream { output_stream: ost.index(), in_time_base, out_time_base, pkt_sender: self.pkt_sender.clone() }
+    }
+    fn add_stream_from_in_stream(&mut self, ist: &Stream) -> DumperStream {
+        self.add_stream(encoder::find(codec::Id::None), ist.parameters(), ist.time_base(), ist.time_base())
+    }
+    fn add_video_encoder(&mut self, codec: Codec, time_base: Rational) -> (DumperStream, codec::Context) {
+        let ost = self.octx.add_stream(Some(codec)).unwrap();
+        let context = ost.codec(); //.encoder().video()?;
+        //TODO: ost.set_parameters(encoder);
+        (DumperStream { output_stream: ost.index(), in_time_base: time_base, out_time_base: time_base, pkt_sender: self.pkt_sender.clone() }, context)
+    }
+    fn has_global_header(&self) -> bool {
+        self.octx.format().flags().contains(format::Flags::GLOBAL_HEADER)
     }
     fn dump(mut self) {
         drop(self.pkt_sender);
@@ -228,20 +205,19 @@ fn main() {
     format::context::input::dump(&ictx, 0, Some(&input_file));
     let mut dumper = Dumper::new(&ictx, output_file.clone());
 
-    ///////////////////////////////
     let audio_decoder_stream = ictx.streams().best(media::Type::Audio).unwrap();
     let audio_decoder_stream_idx = audio_decoder_stream.index();
-    let mut audio_decoder = AudioDecoder { decoder: audio_decoder_stream.codec().decoder().audio().unwrap() };
+    let audio_decoder = AudioDecoder { decoder: audio_decoder_stream.codec().decoder().audio().unwrap() };
     let (decoder_sender, decoder_receiver) = sync_channel(100);
     let j = thread::spawn(move || audio_decoder.decode(decoder_receiver));
-    // VideoEncoder::new()
-    //////////////////////////////
+    let v = VideoEncoder::new(100, 100, Rational(60, 1), &mut dumper, x264_opts).unwrap();
+    let j3 = thread::spawn(move || v.gen_frames());
     let dumper_streams: HashMap<_, _> = ictx.streams()
         .filter(|ist| ist.codec().medium() != media::Type::Video)
-        .map(|ist| (ist.index(), dumper.add_stream(&ist)))
+        .map(|ist| (ist.index(), dumper.add_stream_from_in_stream(&ist)))
         .collect();
 
-    let j2 = { thread::spawn(move || dumper.dump()) };
+    let j2 = thread::spawn(move || dumper.dump());
 
     for (stream, mut packet) in ictx.packets() {
         let ist_index = stream.index();
@@ -254,12 +230,11 @@ fn main() {
         }
     }
 
-    // video_encoder.send_eof_to_encoder();
-    // video_encoder.receive_and_process_encoded_packets(&mut octx, ost_time_base);
 
     drop(decoder_sender);
     drop(dumper_streams);
     j.join().unwrap();
+    j3.join().unwrap();
     j2.join().unwrap();
     println!("{}", output_file);
 }
