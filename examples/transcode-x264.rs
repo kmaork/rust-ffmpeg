@@ -21,11 +21,9 @@ use std::collections::HashMap;
 use std::{env, thread};
 use std::time::Instant;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use ffmpeg::{
-    codec, decoder, encoder, format, frame, log, media, picture, Dictionary, Packet, Rational,
-};
-use ffmpeg::device::input::audio;
-use ffmpeg::codec::traits::Decoder;
+use ffmpeg::{codec, decoder, encoder, format, frame, log, media, Dictionary, Packet, Rational, Stream};
+use ffmpeg::format::context;
+use ffmpeg::frame::Audio;
 
 const DEFAULT_X264_OPTS: &str = "preset=medium";
 
@@ -141,25 +139,76 @@ impl AudioDecoder {
     fn receive_and_process_decoded_frames(&mut self) {
         let mut frame = frame::Audio::empty();
         while self.decoder.receive_frame(&mut frame).is_ok() {
-            let timestamp = frame.timestamp();
-            self.log_progress(f64::from(
-                Rational(timestamp.unwrap_or(0) as i32, 1) * self.decoder.time_base(),
-            ));
+            self.log_progress(&frame);
         }
     }
-    fn log_progress(&mut self, timestamp: f64) {
-        eprintln!("timestamp: {:8.2}", timestamp);
+    fn log_progress(&mut self, frame: &Audio) {
+        let ts = f64::from(
+            Rational(frame.timestamp().unwrap_or(0) as i32, 1) * self.decoder.time_base(),
+        );
+        eprintln!("timestamp: {:8.2}, planes: {}, data: {:?}", ts, frame.planes(), &frame.data(0)[..10]);
+    }
+
+    fn decode(mut self, packet_receiver: Receiver<Packet>) {
+        for packet in packet_receiver.iter() {
+            self.send_packet_to_decoder(&packet);
+            self.receive_and_process_decoded_frames();
+        }
+        self.send_eof_to_decoder();
+        self.receive_and_process_decoded_frames();
     }
 }
 
-fn decode(pkt_receiver: Receiver<Packet>, mut audio_decoder: AudioDecoder) {
-    for pkt in pkt_receiver.iter() {
-        audio_decoder.send_packet_to_decoder(&pkt);
-        audio_decoder.receive_and_process_decoded_frames();
-    }
-    audio_decoder.send_eof_to_decoder();
-    audio_decoder.receive_and_process_decoded_frames();
+struct DumperStream {
+    output_stream: usize,
+    in_time_base: Rational,
+    out_time_base: Rational,
+    pkt_sender: SyncSender<Packet>,
 }
+
+impl DumperStream {
+    fn send_pkt(&self, mut packet: Packet) {
+        packet.rescale_ts(self.in_time_base, self.out_time_base);
+        packet.set_stream(self.output_stream);
+        self.pkt_sender.send(packet).unwrap();
+    }
+}
+
+struct Dumper {
+    octx: context::Output,
+    pkt_sender: SyncSender<Packet>,
+    pkt_receiver: Receiver<Packet>,
+}
+
+impl Dumper {
+    fn new(ictx: &context::Input, output_file: String) -> Self {
+        let mut octx = format::output(&output_file).unwrap();
+        octx.set_metadata(ictx.metadata().to_owned());
+        format::context::output::dump(&octx, 0, Some(&output_file));
+        let (pkt_sender, pkt_receiver) = sync_channel(1000);
+        Self { octx, pkt_sender, pkt_receiver }
+    }
+    fn add_stream(&mut self, ist: &Stream) -> DumperStream {
+        // Set up for stream copy for non-video stream.
+        let mut ost = self.octx.add_stream(encoder::find(codec::Id::None)).unwrap();
+        ost.set_parameters(ist.parameters());
+        ost.set_time_base(ist.time_base());
+        // We need to set codec_tag to 0 lest we run into incompatible codec tag
+        // issues when muxing into a different container format. Unfortunately
+        // there's no high level API to do this (yet).
+        unsafe { (*ost.parameters().as_mut_ptr()).codec_tag = 0; }
+        DumperStream { output_stream: ost.index(), in_time_base: ist.time_base(), out_time_base: ost.time_base(), pkt_sender: self.pkt_sender.clone() }
+    }
+    fn dump(mut self) {
+        drop(self.pkt_sender);
+        self.octx.write_header().unwrap();
+        for packet in self.pkt_receiver.iter() {
+            packet.write_interleaved(&mut self.octx).unwrap();
+        }
+        self.octx.write_trailer().unwrap();
+    }
+}
+
 
 fn main() {
     let input_file = env::args().nth(1).expect("missing input file");
@@ -176,61 +225,41 @@ fn main() {
     log::set_level(log::Level::Info);
 
     let mut ictx = format::input(&input_file).unwrap();
-    let mut octx = format::output(&output_file).unwrap();
-
     format::context::input::dump(&ictx, 0, Some(&input_file));
+    let mut dumper = Dumper::new(&ictx, output_file.clone());
 
     ///////////////////////////////
     let audio_decoder_stream = ictx.streams().best(media::Type::Audio).unwrap();
     let audio_decoder_stream_idx = audio_decoder_stream.index();
     let mut audio_decoder = AudioDecoder { decoder: audio_decoder_stream.codec().decoder().audio().unwrap() };
     let (decoder_sender, decoder_receiver) = sync_channel(100);
-    // let (copy_sender, copy_receiver) = sync_channel(100);
-    let j = thread::spawn(move || decode(decoder_receiver, audio_decoder));
+    let j = thread::spawn(move || audio_decoder.decode(decoder_receiver));
     // VideoEncoder::new()
     //////////////////////////////
+    let dumper_streams: HashMap<_, _> = ictx.streams()
+        .filter(|ist| ist.codec().medium() != media::Type::Video)
+        .map(|ist| (ist.index(), dumper.add_stream(&ist)))
+        .collect();
 
-    let mut stream_mapping: Vec<Option<usize>> = vec![None; ictx.nb_streams() as _];
-
-    let mut ost_index = 0;
-    for (ist_index, ist) in ictx.streams().enumerate() {
-        if ist.codec().medium() != media::Type::Video {
-            stream_mapping[ist_index] = Some(ost_index);
-            // Set up for stream copy for non-video stream.
-            let mut ost = octx.add_stream(encoder::find(codec::Id::None)).unwrap();
-            ost.set_parameters(ist.parameters());
-            // We need to set codec_tag to 0 lest we run into incompatible codec tag
-            // issues when muxing into a different container format. Unfortunately
-            // there's no high level API to do this (yet).
-            unsafe {
-                (*ost.parameters().as_mut_ptr()).codec_tag = 0;
-            }
-            ost_index += 1;
-        }
-    }
-
-    octx.set_metadata(ictx.metadata().to_owned());
-    format::context::output::dump(&octx, 0, Some(&output_file));
-    octx.write_header().unwrap();
+    let j2 = { thread::spawn(move || dumper.dump()) };
 
     for (stream, mut packet) in ictx.packets() {
         let ist_index = stream.index();
-        if let Some(ost_index) = stream_mapping[ist_index] {
-            let ost_time_base = octx.stream(ost_index).unwrap().time_base();
-            packet.rescale_ts(stream.time_base(), ost_time_base);
-            packet.set_stream(ost_index);
+        if let Some(dumper_stream) = dumper_streams.get(&ist_index) {
             packet.set_position(-1);
             if ist_index == audio_decoder_stream_idx {
-                decoder_sender.send(packet.clone());
+                decoder_sender.send(packet.clone()).unwrap();
             }
-            packet.write_interleaved(&mut octx).unwrap();
+            dumper_stream.send_pkt(packet);
         }
     }
 
     // video_encoder.send_eof_to_encoder();
     // video_encoder.receive_and_process_encoded_packets(&mut octx, ost_time_base);
 
-    octx.write_trailer().unwrap();
     drop(decoder_sender);
+    drop(dumper_streams);
     j.join().unwrap();
+    j2.join().unwrap();
+    println!("{}", output_file);
 }
