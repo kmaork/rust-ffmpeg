@@ -13,7 +13,7 @@ extern crate ffmpeg_next as ffmpeg;
 use std::collections::HashMap;
 use std::{env, thread};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use ffmpeg::{codec, decoder, encoder, format, frame, log, media, Dictionary, Packet, Rational, Stream, Codec};
+use ffmpeg::{codec, decoder, encoder, format, frame, log, media, Dictionary, Packet, Rational, Stream, Codec, software::scaling};
 use ffmpeg::format::context;
 use ffmpeg::frame::Audio;
 use ffmpeg::codec::Parameters;
@@ -53,9 +53,18 @@ impl VideoEncoder {
     }
 
     fn gen_frame(&mut self, timestamp: i64) {
-        let mut frame = frame::Video::new(format::Pixel::YUV420P, 100, 100);
+        let mut iframe = frame::Video::new(format::Pixel::RGB24, self.encoder.width(), self.encoder.height());
+        let p: &mut [[u8; 3]] = iframe.plane_mut(0);
+        for c in p {
+            c[0] = 255;
+            c[1] = 100;
+            c[2] = 255;
+        }
+        let mut frame = frame::Video::new(self.encoder.format(), self.encoder.width(), self.encoder.height());
+        scaling::Context::get(iframe.format(), iframe.width(), iframe.height(), frame.format(),
+                              frame.width(), frame.height(), scaling::Flags::empty())
+            .unwrap().run(&iframe, &mut frame).unwrap();
         frame.set_pts(Some(timestamp));
-        // frame.set_kind(picture::Type::None);
         self.encoder.send_frame(&frame).unwrap();
         self.receive_and_process_encoded_packets();
     }
@@ -68,7 +77,7 @@ impl VideoEncoder {
     }
 
     fn gen_frames(mut self) {
-        for i in 0..1000 {
+        for i in 0..300 {
             self.gen_frame(i);
         }
         self.encoder.send_eof().unwrap();
@@ -171,7 +180,12 @@ impl Dumper {
         let ost = self.octx.add_stream(Some(codec)).unwrap();
         let context = ost.codec(); //.encoder().video()?;
         //TODO: ost.set_parameters(encoder);
-        (DumperStream { output_stream: ost.index(), in_time_base: time_base, out_time_base: time_base, pkt_sender: self.pkt_sender.clone() }, context)
+        (DumperStream {
+            output_stream: ost.index(),
+            in_time_base: time_base,
+            out_time_base: time_base,
+            pkt_sender: self.pkt_sender.clone(),
+        }, context)
     }
     fn has_global_header(&self) -> bool {
         self.octx.format().flags().contains(format::Flags::GLOBAL_HEADER)
@@ -210,7 +224,7 @@ fn main() {
     let audio_decoder = AudioDecoder { decoder: audio_decoder_stream.codec().decoder().audio().unwrap() };
     let (decoder_sender, decoder_receiver) = sync_channel(100);
     let j = thread::spawn(move || audio_decoder.decode(decoder_receiver));
-    let v = VideoEncoder::new(100, 100, Rational(60, 1), &mut dumper, x264_opts).unwrap();
+    let v = VideoEncoder::new(700, 500, Rational(60, 1), &mut dumper, x264_opts).unwrap();
     let j3 = thread::spawn(move || v.gen_frames());
     let dumper_streams: HashMap<_, _> = ictx.streams()
         .filter(|ist| ist.codec().medium() != media::Type::Video)
@@ -238,3 +252,6 @@ fn main() {
     j2.join().unwrap();
     println!("{}", output_file);
 }
+
+
+// todo: set time base and frame times accroding to decoder
