@@ -58,7 +58,7 @@ impl VideoEncoder {
         for c in p {
             c[0] = 255;
             c[1] = 100;
-            c[2] = 255;
+            c[2] = 0;
         }
         let mut frame = frame::Video::new(self.encoder.format(), self.encoder.width(), self.encoder.height());
         scaling::Context::get(iframe.format(), iframe.width(), iframe.height(), frame.format(),
@@ -77,7 +77,7 @@ impl VideoEncoder {
     }
 
     fn gen_frames(mut self) {
-        for i in 0..300 {
+        for i in 0..1000 {
             self.gen_frame(i);
         }
         self.encoder.send_eof().unwrap();
