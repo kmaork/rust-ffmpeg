@@ -253,7 +253,16 @@ impl Dumper {
     }
     fn dump(mut self) {
         drop(self.pkt_sender);
+        let time_bases: Vec<_> = self
+            .octx
+            .streams()
+            .map(|stream| stream.time_base())
+            .collect();
         self.octx.write_header().unwrap();
+        self.octx
+            .streams_mut()
+            .zip(time_bases)
+            .for_each(|(mut stream, tb)| stream.set_time_base(tb));
         for packet in self.pkt_receiver.iter() {
             packet.write_interleaved(&mut self.octx).unwrap();
         }
