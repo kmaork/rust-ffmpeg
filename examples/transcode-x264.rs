@@ -23,22 +23,22 @@ use std::{env, thread};
 
 const DEFAULT_X264_OPTS: &str = "preset=medium";
 
-struct VideoEncoder {
-    dumper_stream: DumperStream,
+struct VideoEncoderBuilder {
+    dumper_stream_slot: DumperStreamSlot,
     encoder: encoder::Video,
 }
 
-impl VideoEncoder {
+impl VideoEncoderBuilder {
     fn new(
         width: u32,
         height: u32,
         frame_rate: Rational,
-        dumper: &mut Dumper,
+        dumper: &mut DumperBuilder,
         x264_opts: Dictionary,
     ) -> Result<Self, ffmpeg::Error> {
         let time_base = frame_rate.invert();
         let global_header = dumper.has_global_header();
-        let (dumper_stream, context) =
+        let (dumper_stream_slot, context) =
             dumper.add_video_encoder(encoder::find(codec::Id::H264).unwrap(), time_base);
         let mut encoder: encoder::video::Video = context.encoder().video()?;
         encoder.set_height(height);
@@ -54,11 +54,25 @@ impl VideoEncoder {
             .open_with(x264_opts)
             .expect("error opening libx264 encoder with supplied settings");
         Ok(Self {
-            dumper_stream,
+            dumper_stream_slot,
             encoder,
         })
     }
 
+    fn build(self, dumper: &Dumper) -> VideoEncoder {
+        VideoEncoder {
+            dumper_stream: dumper.link(self.dumper_stream_slot),
+            encoder: self.encoder,
+        }
+    }
+}
+
+struct VideoEncoder {
+    dumper_stream: DumperStream,
+    encoder: encoder::Video,
+}
+
+impl VideoEncoder {
     fn gen_frame(&mut self, timestamp: i64) {
         let mut iframe = frame::Video::new(
             format::Pixel::RGB24,
@@ -162,28 +176,38 @@ impl AudioDecoder {
     }
 }
 
-struct DumperStream {
+struct DumperStreamSlot {
     output_stream: usize,
     in_time_base: Rational,
-    out_time_base: Rational,
     pkt_sender: SyncSender<Packet>,
+}
+
+impl DumperStreamSlot {
+    fn output_stream(&self) -> usize {
+        self.output_stream
+    }
+}
+
+struct DumperStream {
+    dumper_stream_slot: DumperStreamSlot,
+    out_time_base: Rational,
 }
 
 impl DumperStream {
     fn send_pkt(&self, mut packet: Packet) {
-        packet.rescale_ts(self.in_time_base, self.out_time_base);
-        packet.set_stream(self.output_stream);
-        self.pkt_sender.send(packet).unwrap();
+        packet.rescale_ts(self.dumper_stream_slot.in_time_base, self.out_time_base);
+        packet.set_stream(self.dumper_stream_slot.output_stream);
+        self.dumper_stream_slot.pkt_sender.send(packet).unwrap();
     }
 }
 
-struct Dumper {
+struct DumperBuilder {
     octx: context::Output,
     pkt_sender: SyncSender<Packet>,
     pkt_receiver: Receiver<Packet>,
 }
 
-impl Dumper {
+impl DumperBuilder {
     fn new(ictx: &context::Input, output_file: String) -> Self {
         let mut octx = format::output(&output_file).unwrap();
         octx.set_metadata(ictx.metadata().to_owned());
@@ -200,30 +224,26 @@ impl Dumper {
         codec: Option<Codec>,
         parameters: Parameters,
         in_time_base: Rational,
-        out_time_base: Rational,
-    ) -> DumperStream {
+    ) -> DumperStreamSlot {
         // Set up for stream copy for non-video stream.
         let mut ost = self.octx.add_stream(codec).unwrap();
         ost.set_parameters(parameters);
-        ost.set_time_base(out_time_base);
         // We need to set codec_tag to 0 lest we run into incompatible codec tag
         // issues when muxing into a different container format. Unfortunately
         // there's no high level API to do this (yet).
         unsafe {
             (*ost.parameters().as_mut_ptr()).codec_tag = 0;
         }
-        DumperStream {
+        DumperStreamSlot {
             output_stream: ost.index(),
             in_time_base,
-            out_time_base,
             pkt_sender: self.pkt_sender.clone(),
         }
     }
-    fn add_stream_from_in_stream(&mut self, ist: &Stream) -> DumperStream {
+    fn add_stream_from_in_stream(&mut self, ist: &Stream) -> DumperStreamSlot {
         self.add_stream(
             encoder::find(codec::Id::None),
             ist.parameters(),
-            ist.time_base(),
             ist.time_base(),
         )
     }
@@ -231,15 +251,14 @@ impl Dumper {
         &mut self,
         codec: Codec,
         time_base: Rational,
-    ) -> (DumperStream, codec::Context) {
+    ) -> (DumperStreamSlot, codec::Context) {
         let ost = self.octx.add_stream(Some(codec)).unwrap();
         let context = ost.codec(); //.encoder().video()?;
                                    //TODO: ost.set_parameters(encoder);
         (
-            DumperStream {
+            DumperStreamSlot {
                 output_stream: ost.index(),
                 in_time_base: time_base,
-                out_time_base: time_base,
                 pkt_sender: self.pkt_sender.clone(),
             },
             context,
@@ -251,18 +270,29 @@ impl Dumper {
             .flags()
             .contains(format::Flags::GLOBAL_HEADER)
     }
-    fn dump(mut self) {
-        drop(self.pkt_sender);
-        let time_bases: Vec<_> = self
-            .octx
-            .streams()
-            .map(|stream| stream.time_base())
-            .collect();
+    fn build(mut self) -> Dumper {
         self.octx.write_header().unwrap();
-        self.octx
-            .streams_mut()
-            .zip(time_bases)
-            .for_each(|(mut stream, tb)| stream.set_time_base(tb));
+        Dumper {
+            pkt_receiver: self.pkt_receiver,
+            octx: self.octx,
+        }
+    }
+}
+
+struct Dumper {
+    octx: context::Output,
+    pkt_receiver: Receiver<Packet>,
+}
+
+impl Dumper {
+    fn link(&self, dumper_stream_slot: DumperStreamSlot) -> DumperStream {
+        let ost = dumper_stream_slot.output_stream();
+        DumperStream {
+            dumper_stream_slot,
+            out_time_base: self.octx.stream(ost).unwrap().time_base(),
+        }
+    }
+    fn dump(mut self) {
         for packet in self.pkt_receiver.iter() {
             packet.write_interleaved(&mut self.octx).unwrap();
         }
@@ -287,7 +317,7 @@ fn main() {
 
     let mut ictx = format::input(&input_file).unwrap();
     format::context::input::dump(&ictx, 0, Some(&input_file));
-    let mut dumper = Dumper::new(&ictx, output_file.clone());
+    let mut dumper_builder = DumperBuilder::new(&ictx, output_file.clone());
 
     let audio_decoder_stream = ictx.streams().best(media::Type::Audio).unwrap();
     let audio_decoder_stream_idx = audio_decoder_stream.index();
@@ -296,16 +326,23 @@ fn main() {
     };
     let (decoder_sender, decoder_receiver) = sync_channel(100);
     let j = thread::spawn(move || audio_decoder.decode(decoder_receiver));
-    let v = VideoEncoder::new(700, 500, Rational(60, 1), &mut dumper, x264_opts).unwrap();
-    let j3 = thread::spawn(move || v.gen_frames());
-    let dumper_streams: HashMap<_, _> = ictx
+    let vb = VideoEncoderBuilder::new(700, 500, Rational(60, 1), &mut dumper_builder, x264_opts)
+        .unwrap();
+
+    let dumper_stream_slots: HashMap<_, _> = ictx
         .streams()
         .filter(|ist| ist.codec().medium() != media::Type::Video)
-        .map(|ist| (ist.index(), dumper.add_stream_from_in_stream(&ist)))
+        .map(|ist| (ist.index(), dumper_builder.add_stream_from_in_stream(&ist)))
         .collect();
+    let dumper = dumper_builder.build();
+    let dumper_streams: HashMap<_, _> = dumper_stream_slots
+        .into_iter()
+        .map(|(ist, slot)| (ist, dumper.link(slot)))
+        .collect();
+    let v = vb.build(&dumper);
 
     let j2 = thread::spawn(move || dumper.dump());
-
+    let j3 = thread::spawn(move || v.gen_frames());
     for (stream, mut packet) in ictx.packets() {
         let ist_index = stream.index();
         if let Some(dumper_stream) = dumper_streams.get(&ist_index) {
