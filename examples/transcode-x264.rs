@@ -115,7 +115,7 @@ impl VideoEncoder {
     }
 
     fn gen_frames(mut self) {
-        for i in 0..1000 {
+        for i in 0..100 {
             self.gen_frame(i);
         }
         self.encoder.send_eof().unwrap();
@@ -137,6 +137,7 @@ fn parse_opts<'a>(s: String) -> Option<Dictionary<'a>> {
 
 struct AudioDecoder {
     decoder: decoder::Audio,
+    in_time_base: Rational,
 }
 
 impl AudioDecoder {
@@ -167,7 +168,8 @@ impl AudioDecoder {
     }
 
     fn decode(mut self, packet_receiver: Receiver<Packet>) {
-        for packet in packet_receiver.iter() {
+        for mut packet in packet_receiver.iter() {
+            packet.rescale_ts(self.in_time_base, self.decoder.time_base());
             self.send_packet_to_decoder(&packet);
             self.receive_and_process_decoded_frames();
         }
@@ -322,6 +324,7 @@ fn main() {
     let audio_decoder_stream = ictx.streams().best(media::Type::Audio).unwrap();
     let audio_decoder_stream_idx = audio_decoder_stream.index();
     let audio_decoder = AudioDecoder {
+        in_time_base: audio_decoder_stream.time_base(),
         decoder: audio_decoder_stream.codec().decoder().audio().unwrap(),
     };
     let (decoder_sender, decoder_receiver) = sync_channel(100);
